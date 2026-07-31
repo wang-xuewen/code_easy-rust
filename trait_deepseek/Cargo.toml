@@ -1,0 +1,134 @@
+[package]
+name = "trait_deepseek"
+version = "0.1.0"
+edition = "2024"
+authors = ["Your Name <your.email@example.com>"]
+description = "完整的Rust Trait示例：分布式任务调度系统"
+license = "MIT"
+repository = "https://github.com/yourusername/trait-demo-scheduler"
+
+
+
+[dependencies]
+# ============ 核心依赖（必需） ============
+tokio = { version = "1.42", features = ["full"] }
+
+# ============ 可选依赖 ============
+# 数据库
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "sqlite"], optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
+
+# Web框架
+axum = { version = "0.7", features = ["json"], optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
+# 日志
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# 错误处理
+anyhow = { version = "1.0", optional = true }
+thiserror = { version = "1.0", optional = true }
+
+# 配置管理
+config = { version = "0.14", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+
+# 工具
+uuid = { version = "1.10", features = ["v4", "serde"], optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+rayon = { version = "1.10", optional = true }
+
+# HTTP客户端
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], optional = true }
+
+# 监控
+prometheus = { version = "0.13", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+pretty_assertions = "1.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+# ============ Features ============
+[features]
+# 默认功能 - 只包含基础必需功能
+default = []
+
+# 数据库支持
+database = ["sqlx", "redis"]
+
+# Web API服务器
+web = ["axum", "tower-http", "serde", "serde_json"]
+
+# 日志追踪
+tracing = ["tracing", "tracing-subscriber"]
+
+# 错误处理
+error-handling = ["anyhow", "thiserror"]
+
+# 配置管理
+config = ["config", "clap"]
+
+# 序列化
+serialization = ["serde", "serde_json", "uuid", "chrono"]
+
+# HTTP客户端
+http-client = ["reqwest"]
+
+# 监控
+monitoring = ["prometheus"]
+
+# 并行处理
+parallel = ["rayon"]
+
+# ---- 组合功能 ----
+# 生产环境（包含常用功能）
+production = [
+    "database",
+    "web",
+    "tracing",
+    "error-handling",
+    "config",
+    "serialization",
+    "http-client",
+    "monitoring",
+    "parallel"
+]
+
+# 全功能（包含所有可选功能）
+full = [
+    "database",
+    "web",
+    "tracing",
+    "error-handling",
+    "config",
+    "serialization",
+    "http-client",
+    "monitoring",
+    "parallel"
+]
+
+# 开发环境（包含额外调试工具）
+development = [
+    "production"
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+# ============ 基准测试 ============
+[[bench]]
+name = "scheduler_benchmark"
+harness = false
