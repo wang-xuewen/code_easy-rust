@@ -3,10 +3,12 @@ use std::fmt::Debug;
 use std::time::{Duration, Instant};
 use std::sync::Arc;
 use tokio::sync::Mutex; // 需要添加 tokio 依赖
+use async_trait::async_trait;  // 导入宏
 
 // ============ 1. 基础Trait定义 ============
 
 /// 任务特质：所有任务必须实现的核心接口
+#[async_trait]  // 添加宏
 pub trait Task: Send + Sync + Debug {
 
     // Send: 确保任务可以安全地转移到另一个线程执行
@@ -64,6 +66,7 @@ pub trait Task: Send + Sync + Debug {
 // ============ 2. Trait继承 ============
 
 /// 可调度任务：继承Task，增加调度相关功能
+#[async_trait]
 pub trait ScheduledTask: Task {
     // 新增方法：调度时间
     fn scheduled_time(&self) -> Instant;
@@ -84,6 +87,7 @@ pub trait ScheduledTask: Task {
 }
 
 /// 可监控任务：继承Task，增加监控功能
+#[async_trait]
 pub trait MonitorableTask: Task {
     // 获取任务进度（0-100）
     fn progress(&self) -> u8;
@@ -97,6 +101,9 @@ pub trait MonitorableTask: Task {
 
 // ============ 3. 具体实现：不同类型的任务 ============
 
+// instant类型：用于测量时间间隔的单调递增时间点类型，只能计算时间差，不能表示具体日期时间。
+// 就像一个只能往前走、不能回退的"秒表"计时器，用来测量代码跑了多久，而不是看现在是几点几分。
+// 比如： Instant::now()：获取当前时间点
 // ---------- 3.1 数据处理任务 ----------
 #[derive(Debug, Clone)]
 pub struct DataProcessingTask {
@@ -559,6 +566,7 @@ async fn main() {
 // ============ 7. 关联类型和泛型约束的高级用法 ============
 
 /// 任务处理器：使用高阶Trait约束
+#[async_trait]
 pub trait TaskProcessor<T: Task> {
     // 使用关联类型
     type Context: Clone + Send + Sync;
