@@ -364,11 +364,12 @@ impl<T: Task> TaskScheduler<T> {
     }
     
     // 带重试的任务执行
-    async fn execute_with_retry(&self, mut task: T) {
+    async fn execute_with_retry(&self, task: T) {
         let max_retries = task.max_retries();
-        let task_id = task.id();
         
         for attempt in 0..=max_retries {
+            let task_id = task.id().clone();
+
             if attempt > 0 {
                 println!("[任务 {:?}] 第 {} 次重试", task_id, attempt);
                 tokio::time::sleep(Duration::from_secs(1)).await;
