@@ -22,7 +22,7 @@ pub trait Task: Send + Sync + Debug {
     // 关联类型：任务的执行结果
     type Output: Clone + Debug + Send + Sync;
     // 关联类型：任务的错误类型
-    type Error: Debug + Send + Sync;
+    type Error: Debug + Send + Sync + From<String>;
 
     // 同步：线程被阻塞，CPU 空转等待
     // 异步：线程被释放，可以去执行其他任务，等结果回来再继续
@@ -66,7 +66,6 @@ pub trait Task: Send + Sync + Debug {
 // ============ 2. Trait继承 ============
 
 /// 可调度任务：继承Task，增加调度相关功能
-#[async_trait]
 pub trait ScheduledTask: Task {
     // 新增方法：调度时间
     fn scheduled_time(&self) -> Instant;
@@ -87,7 +86,6 @@ pub trait ScheduledTask: Task {
 }
 
 /// 可监控任务：继承Task，增加监控功能
-#[async_trait]
 pub trait MonitorableTask: Task {
     // 获取任务进度（0-100）
     fn progress(&self) -> u8;
@@ -128,6 +126,7 @@ impl DataProcessingTask {
     }
 }
 
+#[async_trait]
 impl Task for DataProcessingTask {
     type Id = String;
     type Output = Vec<u8>;
@@ -192,6 +191,7 @@ impl HttpRequestTask {
     }
 }
 
+#[async_trait]
 impl Task for HttpRequestTask {
     type Id = u64;
     type Output = String;
@@ -259,6 +259,7 @@ impl DatabaseBackupTask {
     }
 }
 
+#[async_trait]
 impl Task for DatabaseBackupTask {
     type Id = String;
     type Output = String;
@@ -394,7 +395,7 @@ impl<T: Task> TaskScheduler<T> {
                     println!("[任务 {:?}] 超时", task_id);
                     if attempt == max_retries as u8 {
                         let mut failed = self.failed.lock().await;
-                        failed.push((task_id, "超时".to_string() as T::Error));
+                        failed.push((task_id, "超时".to_string().into()));
                     }
                 }
             }
