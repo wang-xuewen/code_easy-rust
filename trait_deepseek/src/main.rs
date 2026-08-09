@@ -26,7 +26,7 @@ pub trait Task: Send + Sync + Debug {
     // 修改点：简化 Error 约束，移除 From<String>，避免后续实现困难
 //     原代码：type Error: ... + From<String>。这要求所有任务的错误类型都必须能从 String 转换而来。这对于标准库错误（如 std::io::Error）很难实现，导致代码难以编写。
 // 修改后：type Error: ... + std::fmt::Display。这是更通用的做法，只要能打印错误信息即可
-    type Error: Debug + Send + Sync + std::fmt::Display;
+    type Error: Debug + Send + Sync + From<String> + std::fmt::Display;
 
     // 同步：线程被阻塞，CPU 空转等待
     // 异步：线程被释放，可以去执行其他任务，等结果回来再继续
@@ -573,32 +573,36 @@ async fn main() {
 
 /// 任务处理器：使用高阶Trait约束
 #[async_trait]
-pub trait TaskProcessor<T: Task> : Send + Sync{
+pub trait TaskProcessor<T: Task>: Send + Sync {
     // 使用关联类型
     type Context: Clone + Send + Sync;
     type Result: Send;
     
-    // 处理任务
-    async fn process(&self, task: &T, context: &Self::Context) -> Self::Result
-    where 
-        Self: Send;  
-//   async fn process(&self, task: T, context: Self::Context) -> Self::Result;
+    // 处理任务 - 使用显式生命周期
+    fn process<'a, 'b>(
+        &'a self, 
+        task: &'b T, 
+        context: &'b Self::Context
+    ) -> impl std::future::Future<Output = Self::Result> + Send;
     
     // 批量处理
-    async fn process_batch(&self, tasks: &[T], context: &Self::Context) -> Vec<Self::Result>
+    fn process_batch<'a, 'b>(
+        &'a self, 
+        tasks: &'b [T], 
+        context: &'b Self::Context
+    ) -> impl std::future::Future<Output = Vec<Self::Result>> + Send
     where
         T: Clone,
-        Self: Send, // 确保 Self 是 Send 的
+        Self: Send,
     {
-        // tasks.iter().map(|t| self.process(t, context)).collect()
-
-        let mut results = Vec::new();
-        // 修正：异步循环，不能直接用 iter().map().collect() 处理异步操作
-        for task in tasks.iter() {
-            let res = self.process(task, context).await;
-            results.push(res);
+        async move {
+            let mut results = Vec::new();
+            for task in tasks.iter() {
+                let res = self.process(task, context).await;
+                results.push(res);
+            }
+            results
         }
-        results
     }
 }
 
@@ -606,28 +610,28 @@ pub trait TaskProcessor<T: Task> : Send + Sync{
 pub struct LoggingTaskProcessor;
 
 impl<T: Task<Output = String>> TaskProcessor<T> for LoggingTaskProcessor {
-
     type Context = String; // 日志前缀
     type Result = String; // 日志输出
     
-    async fn process(&self, task: &T, context: &Self::Context) -> Self::Result 
-    {
+    fn process<'a, 'b>(
+        &'a self, 
+        task: &'b T, 
+        context: &'b Self::Context
+    ) -> impl std::future::Future<Output = Self::Result> + Send {
+        async move {
+            let execution_result = task.execute().await;
 
-        let execution_result = task.execute().await;
-
-        match execution_result {
-            Ok(output) => {
-                // 执行成功
-                format!("[{}] ✅ 任务 {:?} 成功，输出: {}", context, task.id(), output)
-            }
-            Err(e) => {
-                // 执行失败
-                format!("[{}] ❌ 任务 {:?} 失败，错误: {}", context, task.id(), e)
+            match execution_result {
+                Ok(output) => {
+                    format!("[{}] ✅ 任务 {:?} 成功，输出: {}", context, task.id(), output)
+                }
+                Err(e) => {
+                    format!("[{}] ❌ 任务 {:?} 失败，错误: {}", context, task.id(), e)
+                }
             }
         }
     }
 }
-
 // ============ 8. 条件编译和派生Trait ============
 
 // 使用条件编译：仅在测试时启用
