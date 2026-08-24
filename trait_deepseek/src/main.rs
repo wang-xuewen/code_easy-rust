@@ -8,6 +8,22 @@ use async_trait::async_trait;  // 导入宏
 // ============ 1. 基础Trait定义 ============
 
 /// 任务特质：所有任务必须实现的核心接口
+// Rust 的 trait 目前不支持 async fn 语法，会编译报错。
+// async fn 本质上是一个语法糖, 等价于返回 impl Future 的函数：fn f() -> impl Future<Output = ()> + Send { ... }
+// impl Trait 是 Rust 中的不透明返回类型（opaque return type），
+// 意思是：函数实际返回某个具体类型，但对外隐藏了它的真实身份，只承诺它满足指定的 trait。
+// impl Future<Output = ()>：返回值实现了 Future trait，且该 Future 完成后产出 ()（即无返回值）。
+// 本质上就是说 Rust 的 trait 目前不支持返回类型不明确的情况。
+// 这个宏做了什么？ 它在底层把 trait 方法改写成了返回 Pin<Box<dyn Future>>（动态分发）
+// #[async_trait] 宏（async-trait crate）的解决方案：
+// 将用户写的 async fn 自动转换为返回 Pin<Box<dyn Future + ...>> 的同步方法。
+// 1. Box 堆分配 Future；dyn Future 采用动态分发（带来微小运行时开销）；
+// 2. Pin 约束满足 Future 需要固定内存地址的要求；
+// 3. 默认生成的 trait object 附带 Send，可通过 #[async_trait(?Send)] 移除；
+// 注意：该库**并未使用关联类型实现**；关联类型是静态分发的零开销备选方案，属于手动实现思路。
+// 或者通过其他方式（如关联类型）来绕过“无法写出匿名类型”的限制。它本质上是将异步函数装箱（Box），
+// 从而让类型变为可写的、已知的（Pin<Box<dyn Future>>）。
+// Rust 的 Future 之所以需要关注内存地址，是因为 async/await 生成的 Future 内部可能包含“自引用”。
 #[async_trait]  // 添加宏
 pub trait Task: Send + Sync + Debug {
 
@@ -72,6 +88,7 @@ pub trait Task: Send + Sync + Debug {
 /// 可调度任务：继承Task，增加调度相关功能
 pub trait ScheduledTask: Task {
     // 新增方法：调度时间
+    // Instant: 用途：计算耗时、定时间隔，不受系统时间篡改影响，不会倒退
     fn scheduled_time(&self) -> Instant;
     
     // 新增方法：是否周期性任务
@@ -148,6 +165,7 @@ impl Task for DataProcessingTask {
         }
         
         // 模拟数据处理：简单的转换
+        // wrapping_add 是 u8 的回绕加法（溢出回绕，不会 panic）。
         let result: Vec<u8> = self.data.iter()
             .map(|b| b.wrapping_add(1))
             .collect();
@@ -330,8 +348,17 @@ impl MonitorableTask for DatabaseBackupTask {
 }
 
 // ============ 4. 任务调度器（使用Trait作为泛型参数） ============
-
 /// 任务调度器
+// Mutex<Vec<T>>	互斥锁，保证同一时刻只有一个线程能访问这个 Vec
+// Arc<Mutex<Vec<T>>>	原子引用计数，允许多个线程共享这个锁的所有权
+// 为什么用 Mutex 而不是 RwLock？
+// Mutex 提供独占访问，适合频繁修改的场景
+// RwLock 允许多个读但只有一个写，但如果你频繁增删，Mutex 更简单高效
+// RwLock 的实现比 Mutex 复杂得多，带来了额外开销，但读多写少的场合，并行效率提升
+// 为什么用 Arc 而不是 Rc？
+// Arc 是线程安全的，允许多个线程共享所有权
+// rc 用于在单线程环境下实现多个所有者共享同一份数据 (rc会更快一些)
+// Vec<(T::Id, T::Error)>	存储失败任务的 ID 和错误信息 组成的元组
 pub struct TaskScheduler<T: Task> {
     tasks: Arc<Mutex<Vec<T>>>,
     completed: Arc<Mutex<Vec<T::Output>>>,
@@ -357,15 +384,22 @@ impl<T: Task> TaskScheduler<T> {
     
     // 执行所有任务
     pub async fn execute_all(&self) {
-        let tasks = {
-            let mut tasks = self.tasks.lock().await;
-            std::mem::take(&mut *tasks)
-        };
-        
-        for task in tasks {
-            self.execute_with_retry(task).await;
-        }
+    // 1. 获取锁
+    let tasks = {
+        let mut tasks = self.tasks.lock().await;
+
+        // lock之后，返回的tasks是 MutexGuard，它不是 Send，不能在 .await 期间持有，所以需要取走所有任务，之后遍历
+        // 在 Rust 异步编程中，.await 点可能发生线程切换
+        // MutexGuard 包含借用引用（&'a Mutex<T>），它被设计为绑定到创建它的线程：
+
+        std::mem::take(&mut *tasks)  // 取走所有任务，留空 Vec
+    };  // 锁在这里释放（tasks 守卫离开作用域）
+    
+    // 2. 在锁外执行耗时操作
+    for task in tasks {  // tasks 是 Vec<T>，不持有锁
+        self.execute_with_retry(task).await;  // 可以安全 await
     }
+}
     
     // 带重试的任务执行
     async fn execute_with_retry(&self, task: T) {
@@ -400,7 +434,16 @@ impl<T: Task> TaskScheduler<T> {
                     println!("[任务 {:?}] 超时", task_id);
                     if attempt == max_retries as u8 {
                         let mut failed = self.failed.lock().await;
+
+                        // 将字符串 "超时" 转换为 Error 类型。
+                        // failed 的类型是 Vec<(Id, Error)>，push 要求第二个元素是 Error 类型。
+                        // 由于 Error 实现了 From<String>，编译器会自动推导出 into() 将 String 转换为 Error。
+                        // 等价于：Error::from("超时".to_string())
                         failed.push((task_id, "超时".to_string().into()));
+
+                        // ✅ 另一种正确的写法
+                        // 因为 Error 是关联类型，需要加 T:: 前缀
+                        // failed.push((task_id, T::Error::from("超时".to_string())));
                     }
                 }
             }
@@ -427,7 +470,7 @@ pub struct TaskStats {
     pub failed: usize,
     pub pending: usize,
 }
-
+// todo
 // ============ 5. 使用Trait对象（动态分发） ============
 
 /// 任务管理器：使用Trait对象存储不同类型的任务
