@@ -38,18 +38,21 @@ pub trait Task: Send + Sync + Debug {
     // 关联类型：任务的执行结果
     type Output: Clone + Debug + Send + Sync;
     // 关联类型：任务的错误类型
-    // type Error: Debug + Send + Sync + From<String>;
-    // 修改点：简化 Error 约束，移除 From<String>，避免后续实现困难
-//     原代码：type Error: ... + From<String>。这要求所有任务的错误类型都必须能从 String 转换而来。这对于标准库错误（如 std::io::Error）很难实现，导致代码难以编写。
-// 修改后：type Error: ... + std::fmt::Display。这是更通用的做法，只要能打印错误信息即可
-    type Error: Debug + Send + Sync + From<String> + std::fmt::Display;
+    // 原写法：type Error: ... + From<String>。这要求所有任务的错误类型都必须能从 String 转换而来，
+    // 这对于标准库错误（如 std::io::Error）很难实现，导致代码难以编写。
+    // 修改后：只要求 Debug + Send + Sync + Display，只要能打印错误信息即可，适用性更广。
+    // 代价：调度器无法凭空构造一个 Error 值，所以"超时"不再塞进 failed 列表，
+    // 而是由 TaskStats::timed_out 单独计数。
+    type Error: Debug + Send + Sync + std::fmt::Display;
 
     // 同步：线程被阻塞，CPU 空转等待
     // 异步：线程被释放，可以去执行其他任务，等结果回来再继续
     // async: 告诉编译器"这个函数包含异步操作，执行时可能会暂停，等待某个操作完成 再继续执行"
 
     // 必须实现的方法：执行任务
-    async fn execute(&self) -> Result<Self::Output, Self::Error>;
+    // 之所以是 &mut self 而不是 &self：任务执行过程中需要更新自身状态
+    // （开始时间、进度、重试次数等），这些状态本身就是任务的一部分。
+    async fn execute(&mut self) -> Result<Self::Output, Self::Error>;
     
     // 必须实现的方法：获取任务ID
     fn id(&self) -> Self::Id;
@@ -76,6 +79,10 @@ pub trait Task: Send + Sync + Debug {
     fn is_retryable(&self) -> bool {
         self.max_retries() > 0
     }
+
+    // 默认实现：每次重试前由调度器调用，用于记录重试次数（默认什么都不做）
+    // 调度器只负责"决定重试"，具体记账交给任务自己，这样没有重试计数的任务也不用写空实现。
+    fn on_retry(&mut self) {}
     
     // 默认实现：获取任务依赖（返回依赖的任务ID列表）
     fn dependencies(&self) -> Vec<Self::Id> {
@@ -153,23 +160,31 @@ impl Task for DataProcessingTask {
     type Output = Vec<u8>;
     type Error = String;
 
-    async fn execute(&self) -> Result<Self::Output, Self::Error> {
+    async fn execute(&mut self) -> Result<Self::Output, Self::Error> {
         println!("[{}] 开始处理数据，大小: {} bytes", self.id, self.data.len());
-        
+
+        // 记录开始时间与初始进度（&mut self 让这些状态可以真正被写回任务）
+        self.start_time = Some(Instant::now());
+        self.progress = 0;
+
         // 模拟复杂的数据处理
         tokio::time::sleep(Duration::from_millis(500)).await;
-        
+
         // 模拟错误：如果数据为空
         if self.data.is_empty() {
+            self.progress = 0;
             return Err("数据为空".to_string());
         }
-        
+
+        self.progress = 50;
+
         // 模拟数据处理：简单的转换
         // wrapping_add 是 u8 的回绕加法（溢出回绕，不会 panic）。
         let result: Vec<u8> = self.data.iter()
             .map(|b| b.wrapping_add(1))
             .collect();
-        
+
+        self.progress = 100;
         println!("[{}] 数据处理完成", self.id);
         Ok(result)
     }
@@ -189,6 +204,41 @@ impl Task for DataProcessingTask {
     fn max_retries(&self) -> u8 {
         5 // 数据任务重试5次
     }
+
+    fn on_retry(&mut self) {
+        self.retry_count += 1;
+    }
+}
+
+impl MonitorableTask for DataProcessingTask {
+    fn progress(&self) -> u8 {
+        self.progress
+    }
+
+    fn status_description(&self) -> String {
+        format!(
+            "处理 {} bytes 数据，进度: {}%，已重试: {} 次",
+            self.data.len(),
+            self.progress,
+            self.retry_count
+        )
+    }
+
+    fn metadata(&self) -> HashMap<String, String> {
+        let mut meta = HashMap::new();
+        meta.insert("type".to_string(), "data-processing".to_string());
+        meta.insert("progress".to_string(), self.progress.to_string());
+        meta.insert("retry_count".to_string(), self.retry_count.to_string());
+        // Instant 只能算时间差，不能表示"几点几分"，所以这里用 elapsed() 得到已耗时
+        meta.insert(
+            "elapsed".to_string(),
+            match self.start_time {
+                Some(t) => format!("{:?}", t.elapsed()),
+                None => "未开始".to_string(),
+            },
+        );
+        meta
+    }
 }
 
 // ---------- 3.2 HTTP请求任务 ----------
@@ -199,6 +249,7 @@ pub struct HttpRequestTask {
     method: String,
     priority: u8,
     retry_count: u8,
+    progress: u8,
 }
 
 impl HttpRequestTask {
@@ -209,6 +260,7 @@ impl HttpRequestTask {
             method,
             priority,
             retry_count: 0,
+            progress: 0,
         }
     }
 }
@@ -219,16 +271,19 @@ impl Task for HttpRequestTask {
     type Output = String;
     type Error = String;
 
-    async fn execute(&self) -> Result<Self::Output, Self::Error> {
+    async fn execute(&mut self) -> Result<Self::Output, Self::Error> {
         println!("[{}] 发起HTTP请求: {} {}", self.id, self.method, self.url);
-        
+        self.progress = 0;
+
         // 模拟HTTP请求
         tokio::time::sleep(Duration::from_millis(300)).await;
-        
+
         if self.url.contains("error") {
+            self.progress = 0;
             return Err(format!("请求失败: {}", self.url));
         }
-        
+
+        self.progress = 100;
         Ok(format!("Response from {}", self.url))
     }
 
@@ -246,6 +301,32 @@ impl Task for HttpRequestTask {
     
     fn name(&self) -> String {
         format!("HTTP-{}-{}", self.method, self.id)
+    }
+
+    fn on_retry(&mut self) {
+        self.retry_count += 1;
+    }
+}
+
+impl MonitorableTask for HttpRequestTask {
+    fn progress(&self) -> u8 {
+        self.progress
+    }
+
+    fn status_description(&self) -> String {
+        format!(
+            "{} {}，进度: {}%，已重试: {} 次",
+            self.method, self.url, self.progress, self.retry_count
+        )
+    }
+
+    fn metadata(&self) -> HashMap<String, String> {
+        let mut meta = HashMap::new();
+        meta.insert("type".to_string(), "http-request".to_string());
+        meta.insert("url".to_string(), self.url.clone());
+        meta.insert("method".to_string(), self.method.clone());
+        meta.insert("retry_count".to_string(), self.retry_count.to_string());
+        meta
     }
 }
 
@@ -266,6 +347,7 @@ pub struct DatabaseBackupTask {
     db_name: String,
     priority: u8,
     progress: u8,
+    retry_count: u8,
     scheduled_at: Instant,
 }
 
@@ -276,6 +358,7 @@ impl DatabaseBackupTask {
             db_name,
             priority,
             progress: 0,
+            retry_count: 0,
             scheduled_at: Instant::now() + Duration::from_secs(5),
         }
     }
@@ -287,18 +370,18 @@ impl Task for DatabaseBackupTask {
     type Output = String;
     type Error = String;
 
-    async fn execute(&self) -> Result<Self::Output, Self::Error> {
+    async fn execute(&mut self) -> Result<Self::Output, Self::Error> {
         println!("[{}] 开始备份数据库: {}", self.id, self.db_name);
-        
-        // 模拟备份过程
+
+        // 模拟备份过程：现在可以真正把进度写回任务（以前只有 &self，只能打印不能更新）
         for i in 0..=100 {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            // 更新进度（实际中会使用可变状态）
+            self.progress = i;
             if i % 20 == 0 {
                 println!("[{}] 备份进度: {}%", self.id, i);
             }
         }
-        
+
         println!("[{}] 数据库备份完成", self.id);
         Ok(format!("Backup of {} completed", self.db_name))
     }
@@ -313,6 +396,10 @@ impl Task for DatabaseBackupTask {
     
     fn timeout(&self) -> Duration {
         Duration::from_secs(30)
+    }
+
+    fn on_retry(&mut self) {
+        self.retry_count += 1;
     }
 }
 
@@ -336,13 +423,18 @@ impl MonitorableTask for DatabaseBackupTask {
     }
     
     fn status_description(&self) -> String {
-        format!("备份数据库 '{}'，进度: {}%", self.db_name, self.progress)
+        format!(
+            "备份数据库 '{}'，进度: {}%，已重试: {} 次",
+            self.db_name, self.progress, self.retry_count
+        )
     }
     
     fn metadata(&self) -> HashMap<String, String> {
         let mut meta = HashMap::new();
         meta.insert("database".to_string(), self.db_name.clone());
         meta.insert("type".to_string(), "backup".to_string());
+        meta.insert("progress".to_string(), self.progress.to_string());
+        meta.insert("retry_count".to_string(), self.retry_count.to_string());
         meta
     }
 }
@@ -362,7 +454,17 @@ impl MonitorableTask for DatabaseBackupTask {
 pub struct TaskScheduler<T: Task> {
     tasks: Arc<Mutex<Vec<T>>>,
     completed: Arc<Mutex<Vec<T::Output>>>,
+    #[allow(clippy::type_complexity)]
     failed: Arc<Mutex<Vec<(T::Id, T::Error)>>>,
+    // 超时次数：Error 不再要求 From<String>，调度器没法凭空造出一个错误值，
+    // 所以超时不进 failed 列表，而是单独计数。
+    timed_out: Arc<Mutex<usize>>,
+}
+
+impl<T: Task> Default for TaskScheduler<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: Task> TaskScheduler<T> {
@@ -371,6 +473,7 @@ impl<T: Task> TaskScheduler<T> {
             tasks: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(Mutex::new(Vec::new())),
             failed: Arc::new(Mutex::new(Vec::new())),
+            timed_out: Arc::new(Mutex::new(0)),
         }
     }
     
@@ -384,8 +487,8 @@ impl<T: Task> TaskScheduler<T> {
     
     // 执行所有任务
     pub async fn execute_all(&self) {
-    // 1. 获取锁
-    let tasks = {
+    // 1. 取走任务
+    let mut tasks = {
         let mut tasks = self.tasks.lock().await;
 
         // lock之后，返回的tasks是 MutexGuard，它不是 Send，不能在 .await 期间持有，所以需要取走所有任务，之后遍历
@@ -398,21 +501,26 @@ impl<T: Task> TaskScheduler<T> {
     };  // 锁在这里释放（tasks 守卫离开作用域）
     
     // 2. 在锁外执行耗时操作
-    for task in tasks {  // tasks 是 Vec<T>，不持有锁
+    for task in tasks.iter_mut() {  // 借用，不消耗任务的所有权
         self.execute_with_retry(task).await;  // 可以安全 await
     }
+
+    // 3. 执行完把任务放回队列：这样 pending 统计才有意义，execute_all 也能重复调用
+    self.tasks.lock().await.extend(tasks);
 }
     
     // 带重试的任务执行
-    async fn execute_with_retry(&self, task: T) {
-        let max_retries = task.max_retries();
+    // 参数是 &mut T：重试前要调用 on_retry()，执行过程中任务内部状态也要能被修改
+    async fn execute_with_retry(&self, task: &mut T) {
+        // is_retryable() 决定要不要重试：返回 false 的任务只执行一次
+        let attempts = if task.is_retryable() { task.max_retries() } else { 0 };
         
-        for attempt in 0..=max_retries {
-            let task_id = task.id().clone();
-
+        for attempt in 0..=attempts {
             if attempt > 0 {
-                println!("[任务 {:?}] 第 {} 次重试", task_id, attempt);
+                println!("[任务 {:?}] 第 {} 次重试", task.id(), attempt);
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                // 通知任务"你被重试了"，由任务自己记账（比如累加 retry_count）
+                task.on_retry();
             }
             
             // 使用超时执行
@@ -420,32 +528,23 @@ impl<T: Task> TaskScheduler<T> {
             
             match result {
                 Ok(Ok(output)) => {
-                    println!("[任务 {:?}] 执行成功", task_id);
-                    let mut completed = self.completed.lock().await;
-                    completed.push(output);
+                    println!("[任务 {:?}] 执行成功", task.id());
+                    self.completed.lock().await.push(output);
                     return;
                 }
                 Ok(Err(e)) => {
-                    println!("[任务 {:?}] 执行失败: {:?}", task_id, e);
-                    if attempt == max_retries as u8 {
-                        let mut failed = self.failed.lock().await;
-                        failed.push((task_id, e));
+                    // Error 现在要求 Display，用 {} 打印即可，不必再 {:?}
+                    println!("[任务 {:?}] 执行失败: {}", task.id(), e);
+                    if attempt == attempts {
+                        self.failed.lock().await.push((task.id(), e));
                     }
                 }
                 Err(_) => {
-                    println!("[任务 {:?}] 超时", task_id);
-                    if attempt == max_retries as u8 {
-                        let mut failed = self.failed.lock().await;
-
-                        // 将字符串 "超时" 转换为 Error 类型。
-                        // failed 的类型是 Vec<(Id, Error)>，push 要求第二个元素是 Error 类型。
-                        // 由于 Error 实现了 From<String>，编译器会自动推导出 into() 将 String 转换为 Error。
-                        // 等价于：Error::from("超时".to_string())
-                        failed.push((task_id, "超时".to_string().into()));
-
-                        // ✅ 另一种正确的写法
-                        // 因为 Error 是关联类型，需要加 T:: 前缀
-                        // failed.push((task_id, T::Error::from("超时".to_string())));
+                    println!("[任务 {:?}] 超时", task.id());
+                    // 移除了 Error: From<String> 约束后，调度器没法再 "超时".into() 造出错误值，
+                    // 所以超时不进 failed 列表，改为单独计数（见 TaskStats::timed_out）。
+                    if attempt == attempts {
+                        *self.timed_out.lock().await += 1;
                     }
                 }
             }
@@ -456,56 +555,126 @@ impl<T: Task> TaskScheduler<T> {
     pub async fn get_stats(&self) -> TaskStats {
         let completed_count = self.completed.lock().await.len();
         let failed_count = self.failed.lock().await.len();
+        let timed_out_count = *self.timed_out.lock().await;
         
         TaskStats {
             completed: completed_count,
             failed: failed_count,
+            timed_out: timed_out_count,
             pending: self.tasks.lock().await.len(),
         }
     }
 }
 
 // 统计信息
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TaskStats {
     pub completed: usize,
     pub failed: usize,
+    /// 超时次数：因为 Error 不再要求 From<String>，超时无法表示成具体错误值，单独计数
+    pub timed_out: usize,
     pub pending: usize,
 }
 
 // ============ 5. 使用Trait对象（动态分发） ============
 
+/// 统一了关联类型（Id / Output / Error 都是 String）的动态任务对象
+/// 用别名把 Box<dyn Task<...>> 这一长串收拢起来，可读性更好（顺带消掉 clippy::type_complexity）
+pub type AnyTask = dyn Task<Id = String, Output = String, Error = String>;
+
+/// 单个任务在管理器中跑完后的结局
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskOutcome {
+    Completed,
+    Failed,
+    TimedOut,
+}
+
 /// 任务管理器：使用Trait对象存储不同类型的任务
 pub struct TaskManager {
     // 动态分发，可以存放任何实现了 Task trait 的类型，但这些类型的 Id、Output、Error 都必须是 String。
-    tasks: Arc<Mutex<Vec<Box<dyn Task<Id = String, Output = String, Error = String>>>>>,
+    tasks: Arc<Mutex<Vec<Box<AnyTask>>>>,
+    stats: Arc<Mutex<TaskStats>>,
+}
+
+impl Default for TaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TaskManager {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(Mutex::new(Vec::new())),
+            stats: Arc::new(Mutex::new(TaskStats::default())),
         }
     }
     
     // 添加不同类型的任务到同一个容器
-    pub async fn add_task(&self, task: Box<dyn Task<Id = String, Output = String, Error = String>>) {
+    pub async fn add_task(&self, task: Box<AnyTask>) {
         let mut tasks = self.tasks.lock().await;
         tasks.push(task);
+        // 和泛型调度器保持一致：按优先级排序
+        tasks.sort_by_key(|t| t.priority());
     }
     
-    // 执行所有任务
+    // 执行所有任务（带重试、超时和统计）
     pub async fn execute_all(&self) {
-        let tasks = {
+        let mut tasks = {
             let mut tasks = self.tasks.lock().await;
-            // // 取走所有任务，留空 Vec
+            // 取走任务，避免持锁 await
             std::mem::take(&mut *tasks)
         };
         
-        for task in tasks {
-            // 使用动态分发
-            let _ = task.execute().await;
+        for task in tasks.iter_mut() {
+            // 使用动态分发：具体类型在运行时才确定
+            let id = task.id();
+            let attempts = if task.is_retryable() { task.max_retries() } else { 0 };
+            let mut outcome = TaskOutcome::Failed;
+
+            for attempt in 0..=attempts {
+                if attempt > 0 {
+                    println!("[任务 {:?}] 第 {} 次重试", id, attempt);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    task.on_retry();
+                }
+
+                match tokio::time::timeout(task.timeout(), task.execute()).await {
+                    Ok(Ok(output)) => {
+                        println!("[任务 {:?}] 执行成功: {}", id, output);
+                        outcome = TaskOutcome::Completed;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        println!("[任务 {:?}] 执行失败: {}", id, e);
+                        outcome = TaskOutcome::Failed;
+                    }
+                    Err(_) => {
+                        println!("[任务 {:?}] 超时", id);
+                        outcome = TaskOutcome::TimedOut;
+                    }
+                }
+            }
+
+            // 统计归集：整个任务跑完后再加一次锁，避免每次尝试都去抢锁
+            let mut stats = self.stats.lock().await;
+            match outcome {
+                TaskOutcome::Completed => stats.completed += 1,
+                TaskOutcome::Failed => stats.failed += 1,
+                TaskOutcome::TimedOut => stats.timed_out += 1,
+            }
         }
+
+        // 执行完把任务放回队列，使 execute_all 可以重复调用
+        self.tasks.lock().await.extend(tasks);
+    }
+
+    // 获取统计信息
+    pub async fn get_stats(&self) -> TaskStats {
+        let mut stats = self.stats.lock().await.clone();
+        stats.pending = self.tasks.lock().await.len();
+        stats
     }
 }
 
@@ -545,7 +714,16 @@ async fn main() {
     scheduler.execute_all().await;
     
     let stats = scheduler.get_stats().await;
-    println!("统计信息: {:?}\n", stats);
+    println!("统计信息: {:?}", stats);
+    // execute_all 执行完会把任务放回队列，所以 pending 是真实的任务总数，不再恒为 0
+    println!("（pending = 队列中仍保留的任务数，执行并不会清空队列）\n");
+
+    // 6.1.1 演示任务自身的监控状态
+    // progress / retry_count / start_time 现在会被真正写入（execute 拿到了 &mut self）
+    let mut monitor_demo = DataProcessingTask::new("task-004".to_string(), vec![9, 8, 7], 1);
+    let _ = monitor_demo.execute().await;
+    println!("任务状态: {}", monitor_demo.status_description());
+    println!("任务元数据: {:?}\n", monitor_demo.metadata());
     
     // 6.2 演示Trait对象
     println!("2. Trait对象演示");
@@ -569,6 +747,7 @@ async fn main() {
     manager.add_task(backup_task).await;
     
     manager.execute_all().await;
+    println!("管理器统计信息: {:?}\n", manager.get_stats().await);
     
     // 6.3 演示Trait继承
     println!("\n3. Trait继承演示");
@@ -587,7 +766,7 @@ async fn main() {
     
     // 6.4 演示完整功能
     println!("\n4. 完整功能演示 - 数据库备份任务");
-    let backup_task = DatabaseBackupTask::new(
+    let mut backup_task = DatabaseBackupTask::new(
         "backup-002".to_string(),
         "analytics_db".to_string(),
         1,
@@ -614,18 +793,22 @@ async fn main() {
     // 执行任务
     let result = backup_task.execute().await;
     println!("执行结果: {:?}", result);
+
+    // 执行完再看监控信息：progress 现在真的会走到 100%，而不是永远停在 0
+    println!("执行后进度: {}%", backup_task.progress());
+    println!("执行后状态: {}", backup_task.status_description());
+    println!("执行后元数据: {:?}", backup_task.metadata());
 }
 
 // ============ 7. 关联类型和泛型约束的高级用法 ============
-// todo
-/// 任务处理器：使用高阶Trait约束
 // [async_trait]这个宏会将你写的 async fn 方法签名，转换为一个返回 Pin<Box<dyn Future<Output = ...> + Send + '_>> 的方法，
 // 从而允许通过 dyn Trait 来使用
 // 什么时候才需要 #[async_trait]？场景 1：需要动态分发（trait object）场景 2：需要向后兼容（Rust 1.75 之前）
 // TaskProcessor<T: Task>：这是一个泛型 trait，T 必须实现 Task trait
 // 在这个trait中，会有也必须有函数使用到这个泛型
-
+// 这里不需要 #[async_trait]，因为 TaskProcessor 只做静态分发，没有 Box<dyn TaskProcessor> 这样的用法
 // #[async_trait] // ← 在旧版本中需要这个宏（Rust 1.75 以下）
+/// 任务处理器：使用高阶Trait约束
 pub trait TaskProcessor<T: Task>: Send + Sync {
 
     // Send：表示所有权可以在线程间转移
@@ -642,9 +825,12 @@ pub trait TaskProcessor<T: Task>: Send + Sync {
     // 它的存活时间不能超过这些引用的最短生命周期。
     // 为什么不都用 'a或者 'b呢:强制它们一样长，会严重限制你的代码灵活性
     // 如果task也用 'a ，那么 task 的生命周期就必须和 self 的生命周期一样长，这显然是不合理的。
+    // task 用 &'b mut：处理一个任务意味着执行它，而执行会修改任务内部状态
+    // 这里刻意保留显式生命周期 'a / 'b 用于讲解（clippy 会建议省略，故 allow）
+    #[allow(clippy::needless_lifetimes)]
     fn process<'a, 'b>(
         &'a self, 
-        task: &'b T, 
+        task: &'b mut T, 
         context: &'b Self::Context
     ) -> impl std::future::Future<Output = Self::Result> + Send;
 
@@ -666,19 +852,19 @@ pub trait TaskProcessor<T: Task>: Send + Sync {
     // 又包含了“已约束”的 Future（impl Future + Send），这使得 trait 作为一个整体变得不可预测，
     // 进而破坏了其作为 trait object 的一致性。
     
-    // 批量处理
+    // 批量处理（需要可变切片，因为逐个处理会修改任务状态；不再要求 T: Clone）
+    #[allow(clippy::needless_lifetimes)]
     fn process_batch<'a, 'b>(
         &'a self, 
-        tasks: &'b [T], 
+        tasks: &'b mut [T], 
         context: &'b Self::Context
     ) -> impl std::future::Future<Output = Vec<Self::Result>> + Send
     where
-        T: Clone,
         Self: Send,
     {
         async move {
             let mut results = Vec::new();
-            for task in tasks.iter() {
+            for task in tasks.iter_mut() {
                 let res = self.process(task, context).await;
                 results.push(res);
             }
@@ -694,9 +880,11 @@ impl<T: Task<Output = String>> TaskProcessor<T> for LoggingTaskProcessor {
     type Context = String; // 日志前缀
     type Result = String; // 日志输出
     
+    // 这里刻意保持 `-> impl Future` 的 RPITIT 写法用于讲解，所以屏蔽 clippy 的 manual_async_fn 建议
+    #[allow(clippy::manual_async_fn, clippy::needless_lifetimes)]
     fn process<'a, 'b>(
         &'a self, 
-        task: &'b T, 
+        task: &'b mut T, 
         context: &'b Self::Context
     ) -> impl std::future::Future<Output = Self::Result> + Send {
         async move {
@@ -722,7 +910,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_task_execution() {
-        let task = DataProcessingTask::new(
+        let mut task = DataProcessingTask::new(
             "test-001".to_string(),
             vec![1, 2, 3],
             1,
@@ -747,5 +935,41 @@ mod tests {
         
         let stats = scheduler.get_stats().await;
         assert_eq!(stats.completed, 1);
+        // 执行完任务仍然留在队列里：pending 不再是 0
+        assert_eq!(stats.pending, 1);
+    }
+
+    // 失败任务会按 max_retries 重试，重试次数通过 on_retry 记到任务上
+    #[tokio::test]
+    async fn test_retry_records_count() {
+        let scheduler = TaskScheduler::<DataProcessingTask>::new();
+        // 空数据必然失败，max_retries 为 5
+        scheduler.add_task(DataProcessingTask::new("test-003".to_string(), vec![], 1)).await;
+        scheduler.execute_all().await;
+
+        let stats = scheduler.get_stats().await;
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.failed, 1);
+
+        let tasks = scheduler.tasks.lock().await;
+        // 跑了 6 次（1 次 + 5 次重试），所以重试计数是 5
+        assert_eq!(tasks[0].retry_count, 5);
+    }
+
+    // 动态分发的 TaskManager 也要能正确统计并保留任务
+    #[tokio::test]
+    async fn test_manager_stats() {
+        let manager = TaskManager::new();
+        manager.add_task(Box::new(HttpRequestTask::new(
+            "2001".to_string(),
+            "https://api.example.com/ok".to_string(),
+            "GET".to_string(),
+            1,
+        ))).await;
+        manager.execute_all().await;
+
+        let stats = manager.get_stats().await;
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.pending, 1);
     }
 }
