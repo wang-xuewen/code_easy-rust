@@ -1,0 +1,24 @@
+[package]
+name = "lifetime_showcase"
+version = "0.1.0"
+edition = "2021"
+description = "全方位展示 Rust 生命周期（lifetime）概念的生产级示例项目"
+license = "MIT OR Apache-2.0"
+keywords = ["lifetime", "borrow-checker", "rust", "learning"]
+categories = ["development-tools", "text-processing"]
+
+# 刻意不引入任何第三方依赖：生命周期是语言内建机制，
+# 用纯标准库最能聚焦其本质，也避免依赖版本噪音。
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[[example]]
+name = "showcase"
+path = "examples/showcase.rs"
