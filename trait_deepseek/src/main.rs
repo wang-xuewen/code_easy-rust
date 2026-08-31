@@ -24,7 +24,7 @@ use async_trait::async_trait;  // 导入宏
 // 或者通过其他方式（如关联类型）来绕过“无法写出匿名类型”的限制。它本质上是将异步函数装箱（Box），
 // 从而让类型变为可写的、已知的（Pin<Box<dyn Future>>）。
 // Rust 的 Future 之所以需要关注内存地址，是因为 async/await 生成的 Future 内部可能包含“自引用”。
-#[async_trait]  // 添加宏
+#[async_trait]  // 这个宏必须添加，因为 Task trait 中有 async fn,并且task被用于动态分发，如果全部静态分发就不用这个宏
 pub trait Task: Send + Sync + Debug {
 
     // Send: 确保任务可以安全地转移到另一个线程执行
@@ -392,7 +392,9 @@ impl<T: Task> TaskScheduler<T> {
         // 在 Rust 异步编程中，.await 点可能发生线程切换
         // MutexGuard 包含借用引用（&'a Mutex<T>），它被设计为绑定到创建它的线程：
 
-        std::mem::take(&mut *tasks)  // 取走所有任务，留空 Vec
+        // 取走所有任务，留空 Vec
+        // 之所以这么做，是为了防止在锁内做耗时操作，耗时操作会导致锁长时间被占用，影响其他任务
+        std::mem::take(&mut *tasks)  
     };  // 锁在这里释放（tasks 守卫离开作用域）
     
     // 2. 在锁外执行耗时操作
@@ -470,11 +472,12 @@ pub struct TaskStats {
     pub failed: usize,
     pub pending: usize,
 }
-// todo
+
 // ============ 5. 使用Trait对象（动态分发） ============
 
 /// 任务管理器：使用Trait对象存储不同类型的任务
 pub struct TaskManager {
+    // 动态分发，可以存放任何实现了 Task trait 的类型，但这些类型的 Id、Output、Error 都必须是 String。
     tasks: Arc<Mutex<Vec<Box<dyn Task<Id = String, Output = String, Error = String>>>>>,
 }
 
@@ -495,6 +498,7 @@ impl TaskManager {
     pub async fn execute_all(&self) {
         let tasks = {
             let mut tasks = self.tasks.lock().await;
+            // // 取走所有任务，留空 Vec
             std::mem::take(&mut *tasks)
         };
         
@@ -613,20 +617,54 @@ async fn main() {
 }
 
 // ============ 7. 关联类型和泛型约束的高级用法 ============
-
+// todo
 /// 任务处理器：使用高阶Trait约束
-#[async_trait]
+// [async_trait]这个宏会将你写的 async fn 方法签名，转换为一个返回 Pin<Box<dyn Future<Output = ...> + Send + '_>> 的方法，
+// 从而允许通过 dyn Trait 来使用
+// 什么时候才需要 #[async_trait]？场景 1：需要动态分发（trait object）场景 2：需要向后兼容（Rust 1.75 之前）
+// TaskProcessor<T: Task>：这是一个泛型 trait，T 必须实现 Task trait
+// 在这个trait中，会有也必须有函数使用到这个泛型
+
+// #[async_trait] // ← 在旧版本中需要这个宏（Rust 1.75 以下）
 pub trait TaskProcessor<T: Task>: Send + Sync {
+
+    // Send：表示所有权可以在线程间转移
+    // Sync：表示不可变引用 &T 可以在线程间共享
+
     // 使用关联类型
     type Context: Clone + Send + Sync;
     type Result: Send;
     
     // 处理任务 - 使用显式生命周期
+    // 返回:表示函数返回一个实现了 Future trait 的类型，并且这个 Future 可以安全地在线程间传递。
+    // Future 是 Rust 异步编程的核心 trait，表示一个可能尚未完成的计算
+    // 这两个生命周期 'a 和 'b 的核心作用是：告诉编译器，返回的 Future 借用了 self、task 和 context 的引用，
+    // 它的存活时间不能超过这些引用的最短生命周期。
+    // 为什么不都用 'a或者 'b呢:强制它们一样长，会严重限制你的代码灵活性
+    // 如果task也用 'a ，那么 task 的生命周期就必须和 self 的生命周期一样长，这显然是不合理的。
     fn process<'a, 'b>(
         &'a self, 
         task: &'b T, 
         context: &'b Self::Context
     ) -> impl std::future::Future<Output = Self::Result> + Send;
+
+    // 如果这样写，就需要 #[async_trait]（Rust 1.75 以下）
+    // async fn process<'a, 'b>(
+    //     &'a self, 
+    //     task: &'b T, 
+    //     context: &'b Self::Context
+    // ) -> Self::Result ;
+
+    // 注意：不能混用以上两种写法：（async fn 和 impl Trait）
+    // 当你在一个 trait 中同时使用这两种写法时：
+    // async fn process(...) -> Self::Result 实际上是 
+    // fn process(...) -> impl Future<Output = Self::Result> 的语法糖。
+    // 这个糖没有指明返回的 Future 是否实现了 Send 或拥有特定的生命周期。
+    // 而 fn process_batch(...) -> impl Future<Output = Vec<Self::Result>> + Send 
+    // 则明确指定了返回的 Future 必须实现 Send。
+    // 这种不统一会导致编译器在推导 trait 的“核心类型”时产生困惑。你的 trait 既包含了“未约束”的 Future（async fn），
+    // 又包含了“已约束”的 Future（impl Future + Send），这使得 trait 作为一个整体变得不可预测，
+    // 进而破坏了其作为 trait object 的一致性。
     
     // 批量处理
     fn process_batch<'a, 'b>(
